@@ -1,7 +1,5 @@
 # AutoTracking_RassibarryPi
 
-# PiFaceTrack: Raspberry Pi 기반 실시간 얼굴 검출·추적 시스템
-
 ## 📋 프로젝트 소개  
 `PiFaceTrack`은 Raspberry Pi 카메라(PiCamera2)와 OpenCV, Ultralytics YOLO, MobileFaceNet 임베딩, 그리고 MOSSE/KCF 트래킹을 결합해 **실시간 얼굴 검출·학습·추적**을 수행하는 파이썬 스크립트입니다.  
 - **TRAINING 모드**: 스페이스바 눌러 기준 얼굴 이미지를 수집 & 임베딩 저장  
