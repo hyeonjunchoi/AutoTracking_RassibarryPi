@@ -8,7 +8,7 @@
 ---
 
 ## ⚙️ 주요 기능  
-- **실시간 얼굴 검출**: Ultralytics YOLOv8n-face 모델 사용  
+- **실시간 얼굴 검출**: Ultralytics YOLOv11n-face 모델 사용  
 - **얼굴 임베딩**: MobileFaceNet을 활용해 112×112 RGB 이미지를 128차원 벡터로 변환  
 - **코사인 유사도 매칭**: 저장한 얼굴 벡터와 실시간 얼굴 간 유사도 계산  
 - **트래킹**: OpenCV Legacy/KCF/MOSSE 트래커로 검출된 얼굴 영역을 프레임 간 연속 추적  
