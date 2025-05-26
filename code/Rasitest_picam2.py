@@ -1,171 +1,130 @@
-import sys
-import pathlib
-import os
-import time
-
-import cv2
-import torch
-import numpy as np
-import torchvision.transforms as T
+import sys, pathlib, os, time, cv2, numpy as np
+import onnxruntime as ort
 from PIL import Image
 from ultralytics import YOLO
 from picamera2 import Picamera2
 
-# ── 경로/모델 로드 ──────────────────────────────────────────────────
-ROOT     = pathlib.Path(__file__).resolve().parent
-MNET_DIR = ROOT / 'MobileFaceNet-master'
-sys.path.append(str(MNET_DIR))
+# ── 경로 설정 ───────────────────────────────────────────────────────
+ROOT = pathlib.Path(__file__).resolve().parent
+sys.path.append(str(ROOT / 'MobileFaceNet-master'))
 
-from mobilefacenet import MobileFaceNet
+# ONNX 파일들
+YOLO_ONNX   = str(ROOT / 'yolov11n-face.onnx')
+MFN_ONNX    = str(ROOT / 'mobilefacenet.onnx')
+SAVE_DIR    = ROOT / 'collected_images'
+SAVE_DIR.mkdir(exist_ok=True)
 
-DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
+# ── YOLOv11n-face 로드 ─────────────────────────────────────────────
+yolo = YOLO(YOLO_ONNX)
 
-# MobileFaceNet 초기화
-net = MobileFaceNet().to(DEVICE)
-net.load_state_dict(
-    torch.load(ROOT/'mobilefacenet.pt', map_location=DEVICE),
-    strict=False
-)
-net.eval()
+# ── MobileFaceNet ONNX Runtime 세션 ─────────────────────────────────
+mfn_sess = ort.InferenceSession(MFN_ONNX, providers=['CPUExecutionProvider'])
+# 입력·출력 이름 가져오기
+mfn_input  = mfn_sess.get_inputs()[0].name       # 보통 "input"
+mfn_output = mfn_sess.get_outputs()[0].name      # 보통 "embeddings"
 
-# YOLO 초기화 (파일명 확인)
-yolo = YOLO(str(ROOT/'yolov11n-face.pt'))
+# ── 전처리 (112×112, RGB 정규화) ────────────────────────────────────
+def emb_from_bgr_onnx(bgr):
+    # BGR → RGB, resize, 정규화, 배치 차원 추가
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(rgb, (112,112)).astype(np.float32) / 255.0
+    img = (img - 0.5) / 0.5
+    # H×W×C → 1×C×H×W
+    tensor = img.transpose(2,0,1)[None, ...]
+    # ONNX Runtime inference
+    out = mfn_sess.run([mfn_output], {mfn_input: tensor})[0]
+    return out[0]  # shape: (embedding_dim,)
 
-# 임베딩 전처리 (MobileFaceNet expects RGB input)
-transform = T.Compose([
-    T.Resize((112,112)),
-    T.ToTensor(),
-    T.Normalize([0.5,0.5,0.5],[0.5,0.5,0.5])
-])
-
-@torch.no_grad()
-def emb_from_rgb(rgb):
-    # rgb is H×W×3 uint8 in [0,255]
-    x = transform(Image.fromarray(rgb)).unsqueeze(0).to(DEVICE)
-    return net(x).squeeze(0).cpu().numpy()
-
-def cos(a,b):
-    return np.dot(a,b) / (np.linalg.norm(a)*np.linalg.norm(b) + 1e-8)
+# ── 기타 유틸 함수 ─────────────────────────────────────────────────
+def cos(a, b):
+    return float(np.dot(a,b) / (np.linalg.norm(a)*np.linalg.norm(b) + 1e-8))
 
 def create_tracker():
-    for ns, fn in [
-        ("legacy","TrackerMOSSE_create"), (None,"TrackerMOSSE_create"),
-        ("legacy","TrackerKCF_create"),   (None,"TrackerKCF_create"),
-        ("legacy","TrackerCSRT_create"),  (None,"TrackerCSRT_create"),
-        ("legacy","TrackerMIL_create"),   (None,"TrackerMIL_create")
-    ]:
+    for ns, fn in [("legacy","TrackerMOSSE_create"),(None,"TrackerMOSSE_create"),
+                   ("legacy","TrackerKCF_create"),  (None,"TrackerKCF_create"),
+                   ("legacy","TrackerCSRT_create"),(None,"TrackerCSRT_create")]:
         mod = getattr(cv2, ns) if ns else cv2
         if hasattr(mod, fn):
             return getattr(mod, fn)()
-    raise RuntimeError("지원되는 트래커가 없습니다.")
+    raise RuntimeError("No tracker available")
 
-# ── 파라미터 ──────────────────────────────────────────────────────
-detect_every, thr = 20, 0.8
-save_dir = ROOT/'collected_images'
-save_dir.mkdir(exist_ok=True)
-
+# ── 메인 루프 ────────────────────────────────────────────────────
 def main():
     trackers, embeds = [], {}
     frame_id, count = 0, 0
-    train = True
-    prev_t, fps, ALPHA = time.time(), 0.0, 0.2
+    train, prev_t, fps = True, time.time(), 0.0
+    ALPHA = 0.2
+    detect_every, thr = 20, 0.8
 
-    # Picamera2 설정: 640×480, 3채널 RGB888
+    # Picamera2 초기화
     picam2 = Picamera2()
-    config = picam2.create_preview_configuration(
-        main={"size": (640, 480), "format": "RGB888"}
-    )
-    picam2.configure(config)
+    cfg = picam2.create_preview_configuration(main={'format':'BGR888','size':(640,480)})
+    picam2.configure(cfg)
     picam2.start()
-    time.sleep(2)  # 워밍업
-
-    window_name = "Picamera2 RGB / MobileFaceNet"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    time.sleep(2)
 
     try:
         while True:
-            rgb_frame = picam2.capture_array()  # (480,640,3) RGB
+            frame = picam2.capture_array()
             frame_id += 1
-
-            # FPS 계산
             now = time.time()
             fps = (1-ALPHA)*fps + ALPHA/(now-prev_t)
             prev_t = now
 
             key = cv2.waitKey(1) & 0xFF
             if key == ord('m'):
-                train = not train
-                frame_id = 0
+                train = not train; frame_id = 0
             if key == 27:  # ESC
                 break
 
-            # detection vs tracking 분기
-            need_det = train or (frame_id % detect_every == 0)
+            # 얼굴 박스 결정 (탐지 vs 트래킹)
+            need = train or (frame_id % detect_every == 0)
             faces = []
-
-            if not need_det:
+            if not need:
                 for tr in trackers:
-                    ok, bb = tr.update(rgb_frame_bgr)
+                    ok, bb = tr.update(frame)
                     if ok:
-                        x,y,w,h = map(int, bb)
-                        faces.append((x, y, x+w, y+h))
+                        x,y,w,h = map(int,bb)
+                        faces.append((x,y,x+w,y+h))
                     else:
-                        need_det = True
+                        need = True
                         break
 
-            if need_det:
-                # YOLO expects BGR input
-                rgb_frame_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-                results = yolo.predict(rgb_frame_bgr, conf=0.5, verbose=False)[0]
-                faces = [tuple(map(int, b.xyxy[0])) for b in results.boxes]
-
-                # 트래커 재설정
+            if need:
+                det = yolo.predict(frame, conf=0.5, verbose=False)[0].boxes
+                faces = [tuple(map(int,b.xyxy[0])) for b in det]
                 trackers.clear()
-                for (x1,y1,x2,y2) in faces:
+                for x1,y1,x2,y2 in faces:
                     tr = create_tracker()
-                    tr.init(rgb_frame_bgr, (x1, y1, x2-x1, y2-y1))
+                    tr.init(frame, (x1,y1,x2-x1,y2-y1))
                     trackers.append(tr)
 
-            # 얼굴별 처리
-            for (x1,y1,x2,y2) in faces:
-                crop_rgb = rgb_frame[y1:y2, x1:x2]
-                if crop_rgb.size == 0:
-                    continue
+            # 박스별 처리
+            for x1,y1,x2,y2 in faces:
+                crop = frame[y1:y2, x1:x2]
+                if crop.size==0: continue
 
-                # TRAIN 모드: 스페이스바로 저장
-                if key == 32 and need_det:
+                # 학습 모드: Space 눌러 저장
+                if key==32 and need:
                     fname = f"face_{count}.jpg"
-                    cv2.imwrite(str(save_dir/fname), cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
-                    embeds[fname] = emb_from_rgb(crop_rgb)
+                    cv2.imwrite(str(SAVE_DIR/fname), crop)
+                    embeds[fname] = emb_from_bgr_onnx(crop)
                     count += 1
 
-                # 매칭
+                # 임베딩 비교
                 if embeds:
-                    e = emb_from_rgb(crop_rgb)
-                    best, sim = max(
-                        ((k, cos(e, v)) for k,v in embeds.items()),
-                        key=lambda x: x[1]
-                    )
-                    if sim > thr:
-                        txt, col = f"TRACK {best} {sim:.2f}", (255,0,0)
-                    else:
-                        txt, col = f"UNKNOWN {sim:.2f}", (0,0,255)
-                    cv2.putText(rgb_frame, txt, (x1, y1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+                    e = emb_from_bgr_onnx(crop)
+                    best, sim = max(((k, cos(e,v)) for k,v in embeds.items()), key=lambda x:x[1])
+                    label, col = (f"TRACK {best} {sim:.2f}", (255,0,0)) if sim>thr else (f"UNKNOWN {sim:.2f}", (0,0,255))
+                    cv2.putText(frame, label, (x1,y1-10), cv2.FONT_HERSHEY_SIMPLEX,0.5,col,1)
+                cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
 
-                cv2.rectangle(rgb_frame, (x1,y1), (x2,y2), (0,255,0), 2)
-
-            # 모드·FPS 표시
             mode = "TRAINING" if train else "TRACKING"
-            cv2.putText(rgb_frame, f"{mode}  FPS:{fps:4.1f}", (10,25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-
-            # 디스플레이: RGB→BGR로 변환
-            display = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
-            cv2.imshow(window_name, display)
+            cv2.putText(frame, f"{mode} FPS:{fps:4.1f}", (10,25), cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+            cv2.imshow("ONNX / Picamera2", frame)
 
     finally:
-        picam2.stop()
+        picam2.close()
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
