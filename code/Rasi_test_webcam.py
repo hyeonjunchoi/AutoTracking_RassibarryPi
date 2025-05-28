@@ -49,7 +49,18 @@ def create_tracker():
         if hasattr(mod, fn):
             return getattr(mod, fn)()
     raise RuntimeError("No tracker available")
-
+# ─── 헬퍼 함수 ───────────────────────────────────────────────────────────
+"""
+def create_tracker():
+    if hasattr(cv2, "legacy"):
+        for ctor in ("TrackerMOSSE_create", "TrackerKCF_create", "TrackerCSRT_create"):
+            if hasattr(cv2.legacy, ctor):
+                return getattr(cv2.legacy, ctor)()
+    for ctor in ("TrackerMOSSE_create", "TrackerKCF_create", "TrackerCSRT_create"):
+        if hasattr(cv2, ctor):
+            return getattr(cv2, ctor)()
+    raise RuntimeError("No supported tracker")
+"""
 def main():
     cap = cv2.VideoCapture(1)
     if not cap.isOpened():
