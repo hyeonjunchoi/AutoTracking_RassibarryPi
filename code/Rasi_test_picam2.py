@@ -78,7 +78,7 @@ def main():
                 break
 
             # 얼굴 박스 결정 (탐지 vs 트래킹)
-            need = train or (frame_id % detect_every == 0)
+            need = train or (frame_id % detect_every == 0) #train 모드 or 탐지 주기일 때 
             faces = []
             if not need:
                 for tr in trackers:
@@ -86,7 +86,7 @@ def main():
                     if ok:
                         x,y,w,h = map(int,bb)
                         faces.append((x,y,x+w,y+h))
-                    else:
+                    else: #tracker가 따라가지 못하는 경우 재탐지
                         need = True
                         break
 
@@ -113,8 +113,8 @@ def main():
 
                 # 임베딩 비교
                 if embeds:
-                    e = emb_from_bgr_onnx(crop)
-                    best, sim = max(((k, cos(e,v)) for k,v in embeds.items()), key=lambda x:x[1])
+                    e = emb_from_bgr_onnx(crop) #crop된 이미지를 계속 emb vector로 저장하기 때문에 계산량이 급증하게 됨   
+                    best, sim = max(((k, cos(e,v)) for k,v in embeds.items()), key=lambda x:x[1]) #train과정에서 저장한 emb vector와 비교, 가장 높은 유사도를 저장
                     label, col = (f"TRACK {best} {sim:.2f}", (255,0,0)) if sim>thr else (f"UNKNOWN {sim:.2f}", (0,0,255))
                     cv2.putText(frame, label, (x1,y1-10), cv2.FONT_HERSHEY_SIMPLEX,0.5,col,1)
                 cv2.rectangle(frame, (x1,y1),(x2,y2),(0,255,0),2)
