@@ -1,172 +1,175 @@
-import sys, pathlib, os, time, cv2, numpy as np
-import onnxruntime as ort
+#!/usr/bin/env python3
+# run_edgeface_usb_gray_lock_toggle_v2.py
+# “Detection 프레임에서만 EdgeFace 임베딩” 버전
+#
+# 흐름 ────────────────────────────────────────────────
+# ① TRAINING  : 매 프레임 YOLO → 트래커·임베딩 생성
+# ② m 키      : TRACKING ↔ TRAINING 토글
+# ③ TRACKING  : DETECT_EVERY 프레임마다 YOLO + 새 임베딩
+# ④ LOCK      : TRACKING 중 db 유사도 ≥ THR → 트래커만
+# ----------------------------------------------------
+
+import time, pathlib, cv2, numpy as np, torch, torchvision.transforms as T
+from PIL import Image
 from ultralytics import YOLO
-from pathlib import Path
+import platform
 
-# ── 경로 설정 ───────────────────────────────────────────────────────
-ROOT = Path(r"C:\Users\user\model")
-sys.path.append(str(ROOT / 'MobileFaceNet-master'))
+# ────────── 경로 & 모델 ──────────
+ROOT       = pathlib.Path(__file__).resolve().parent
+YOLO_W     = ROOT / "yolov11n-face.onnx"
+EDGE_MODEL = "edgeface_xxs"
+EDGE_CKPT  = ROOT / "edgeface_xxs.pt"          # 사전 다운로드 필요
 
-# ONNX 파일들
-MFN_ONNX  = str(ROOT / 'mobilefacenet.onnx')
-SAVE_DIR  = ROOT / 'collected_images'
-SAVE_DIR.mkdir(exist_ok=True)
+if not EDGE_CKPT.exists():
+    raise FileNotFoundError(
+        "edgeface_xxs.pt 가 없습니다.\n"
+        "https://huggingface.co/Idiap/EdgeFace-XXS/resolve/main/edgeface_xxs.pt"
+        " 에서 다운로드해 이 스크립트와 같은 폴더에 넣어 주세요."
+    )
 
-# ── YOLOv11n-face 로드 ─────────────────────────────────────────────
-yolo = YOLO(model=str(ROOT/'yolov11n-face.onnx'), task="detect")
+yolo = YOLO(model=str(YOLO_W), task="detect")
 
-# ── MobileFaceNet ONNX Runtime 세션 ─────────────────────────────────
-mfn_sess = ort.InferenceSession(MFN_ONNX, providers=['CPUExecutionProvider'])
-mfn_input  = mfn_sess.get_inputs()[0].name
-mfn_output = mfn_sess.get_outputs()[0].name
+# EdgeFace 구조만 로드 → 로컬 가중치 주입
+edgeface = torch.hub.load(
+    "otroshi/edgeface", EDGE_MODEL,
+    pretrained=False, trust_repo=True, source="github"
+)
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+edgeface = edgeface.eval().to(DEVICE)
+edgeface.load_state_dict(torch.load(EDGE_CKPT, map_location=DEVICE), strict=True)
 
-def emb_from_bgr_onnx(bgr):
+# ────────── 전처리 & 임베딩 함수 ──────────
+xfm = T.Compose([
+    T.Resize((112, 112)), T.ToTensor(),
+    T.Normalize([0.5] * 3, [0.5] * 3)
+])
+
+@torch.no_grad()
+def emb(bgr: np.ndarray) -> np.ndarray:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(rgb, (112,112)).astype(np.float32) / 255.0
-    img = (img - 0.5) / 0.5
-    tensor = img.transpose(2,0,1)[None, ...]
-    out = mfn_sess.run([mfn_output], {mfn_input: tensor})[0]
-    return out[0]
+    return edgeface(xfm(Image.fromarray(rgb)).unsqueeze(0).to(DEVICE)
+                    ).squeeze(0).cpu().numpy()
 
 def cos(a, b):
-    return float(np.dot(a,b) / (np.linalg.norm(a)*np.linalg.norm(b) + 1e-8))
+    return float(np.dot(a, b) /
+                 (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))
 
 def create_tracker():
-    # legacy가 있는지 미리 확인
-    has_legacy = hasattr(cv2, 'legacy')
-    for ns, fn in [
-        ("legacy","TrackerMOSSE_create"), (None,"TrackerMOSSE_create"),
-        ("legacy","TrackerKCF_create"),   (None,"TrackerKCF_create"),
-        ("legacy","TrackerCSRT_create"),  (None,"TrackerCSRT_create")
-    ]:
-        if ns == "legacy":
-            if not has_legacy:
-                continue
-            mod = cv2.legacy
-        else:
-            mod = cv2
+    if hasattr(cv2, "TrackerMOSSE_create"):            return cv2.TrackerMOSSE_create()
+    if hasattr(cv2.legacy, "TrackerMOSSE_create"):     return cv2.legacy.TrackerMOSSE_create()
+    if hasattr(cv2, "TrackerKCF_create"):              return cv2.TrackerKCF_create()
+    if hasattr(cv2.legacy, "TrackerKCF_create"):       return cv2.legacy.TrackerKCF_create()
+    raise RuntimeError("OpenCV MOSSE/KCF 트래커 미지원")
 
-        if hasattr(mod, fn):
-            return getattr(mod, fn)()
-    raise RuntimeError("No tracker available")
-# ─── 헬퍼 함수 ───────────────────────────────────────────────────────────
-"""
-def create_tracker():
-    if hasattr(cv2, "legacy"):
-        for ctor in ("TrackerMOSSE_create", "TrackerKCF_create", "TrackerCSRT_create"):
-            if hasattr(cv2.legacy, ctor):
-                return getattr(cv2.legacy, ctor)()
-    for ctor in ("TrackerMOSSE_create", "TrackerKCF_create", "TrackerCSRT_create"):
-        if hasattr(cv2, ctor):
-            return getattr(cv2, ctor)()
-    raise RuntimeError("No supported tracker")
-"""
+# ────────── 파라미터 ──────────
+DETECT_EVERY = 20
+THR          = 0.70
+SAVE_DIR     = ROOT / "collected_images"
+SAVE_DIR.mkdir(exist_ok=True)
+
+# 트래커 + 캐시 임베딩 보관용
+class FaceTrack:
+    def __init__(self, tracker, vec):
+        self.tracker = tracker
+        self.vec     = vec
+
+# ────────── 메인 루프 ──────────
 def main():
-    cap = cv2.VideoCapture(1)
+    tracks: list[FaceTrack] = []
+    db: dict[str, np.ndarray] = {}
+    fid = saved = 0
+    mode = "TRAINING"                 # TRAINING / TRACKING / LOCK
+    prev, fps, ALPHA = time.time(), 0.0, 0.2
+
+    # ── 카메라 초기화 (OS별 백엔드) ──
+    if platform.system() == "Windows":
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    else:
+        cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+
     if not cap.isOpened():
-        print("Cannot open webcam")
-        return
+        raise RuntimeError("웹캠을 열 수 없습니다. 인덱스·권한·드라이버를 확인하세요.")
 
-    trackers = []
-    embeds   = {}
-    faces    = []
-    frame_id = 0
-    count    = 0
-    train    = True
-    prev_t   = time.time()
-    fps      = 0.0
-    ALPHA    = 0.2
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
-    detect_every  = 20
-    emb_interval  = 30
-    emb_threshold = 0.75
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            print("⚠️  카메라 프레임을 읽을 수 없습니다."); break
 
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            frame_id += 1
+        gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        frame = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        fid  += 1
 
-            now = time.time()
-            fps = (1-ALPHA)*fps + ALPHA/(now-prev_t)
-            prev_t = now
+        now  = time.time()
+        fps  = (1 - ALPHA) * fps + ALPHA / (now - prev)
+        prev = now
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('m'):
-                print("Embeds:", list(embeds.keys()))
-                train = not train
-                frame_id = 0
-                trackers.clear()
-                faces.clear()
-            if key == 27:
-                break
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('m'):
+            mode = "TRAINING" if mode != "TRAINING" else "TRACKING"
+            tracks.clear(); fid = 0
+        elif key == 27:
+            break
 
-            faces.clear()
-            if train:
-                det = yolo.predict(frame, conf=0.5, verbose=False)[0].boxes
-                for b in det:
-                    x1,y1,x2,y2 = map(int, b.xyxy[0])
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), (255,0,0), 2)
-                    if key == 32:
-                        crop = frame[y1:y2, x1:x2]
-                        fname = f"face_{count}.jpg"
-                        cv2.imwrite(str(SAVE_DIR/fname), crop)
-                        embeds[fname] = emb_from_bgr_onnx(crop)
-                        count += 1
-            else:
-                # 재탐지 조건
-                if frame_id % detect_every == 0 or not trackers:
-                    trackers.clear()
-                    det = yolo.predict(frame, conf=0.5, verbose=False)[0].boxes
-                    for b in det:
-                        x1,y1,x2,y2 = map(int, b.xyxy[0])
-                        tr = create_tracker()
-                        tr.init(frame, (x1,y1,x2-x1,y2-y1))
-                        trackers.append(tr)
-                        faces.append((x1,y1,x2,y2))
+        faces = []
+        need_det = (mode == "TRAINING") or (mode == "TRACKING" and fid % DETECT_EVERY == 0)
+
+        # ── 트래커 업데이트 ──
+        if mode != "TRAINING":
+            for ft in tracks[:]:
+                ok, bb = ft.tracker.update(frame)
+                if ok:
+                    x, y, w, h = map(int, bb)
+                    faces.append((x, y, x + w, y + h, ft))  # ft 포함
                 else:
-                    ok, bb = trackers[0].update(frame)
-                    if ok:
-                        x,y,w,h = map(int, bb)
-                        if frame_id % emb_interval == 0 and embeds:
-                            crop = frame[y:y+h, x:x+w]
-                            e = emb_from_bgr_onnx(crop)
-                            best_sim = max(cos(e, v) for v in embeds.values())
-                            if best_sim < emb_threshold:
-                                trackers.clear()
-                                det = yolo.predict(frame, conf=0.5, verbose=False)[0].boxes
-                                for b in det:
-                                    x1,y1,x2,y2 = map(int, b.xyxy[0])
-                                    tr = create_tracker()
-                                    tr.init(frame, (x1,y1,x2-x1,y2-y1))
-                                    trackers.append(tr)
-                                    faces.append((x1,y1,x2,y2))
-                            else:
-                                faces.append((x, y, x+w, y+h))
-                        else:
-                            faces.append((x, y, x+w, y+h))
-                    else:
-                        trackers.clear()
-                        det = yolo.predict(frame, conf=0.5, verbose=False)[0].boxes
-                        for b in det:
-                            x1,y1,x2,y2 = map(int, b.xyxy[0])
-                            tr = create_tracker()
-                            tr.init(frame, (x1,y1,x2-x1,y2-y1))
-                            trackers.append(tr)
-                            faces.append((x1,y1,x2,y2))
+                    tracks.remove(ft)
+                    mode = "TRACKING"
 
-                for (x1,y1,x2,y2) in faces:
-                    cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+        # ── YOLO 탐지 & (한 번만) 임베딩 ──
+        if need_det:
+            res = yolo.predict(frame, conf=0.5, verbose=False)
+            boxes = [tuple(map(int, b.xyxy[0])) for b in res[0].boxes]
+            tracks.clear(); faces.clear()
+            for (x1, y1, x2, y2) in boxes:
+                tr = create_tracker()
+                tr.init(frame, (x1, y1, x2 - x1, y2 - y1))
+                vec = emb(frame[y1:y2, x1:x2])       # ← 이 시점 ‘한 번’ 계산
+                ft  = FaceTrack(tr, vec)
+                tracks.append(ft)
+                faces.append((x1, y1, x2, y2, ft))
 
-            mode = "TRAINING" if train else "TRACKING"
-            cv2.putText(frame, f"{mode}  FPS:{fps:4.1f}", (10,25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
-            cv2.imshow("Webcam ONNX Tracking", frame)
+        # ── 얼굴별 처리 ──
+        for (x1, y1, x2, y2, ft) in faces:
+            crop = frame[y1:y2, x1:x2]
+            if 0 in crop.shape:
+                continue
 
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
+            # SPACE 키로 샘플 저장
+            if key == 32 and need_det:
+                name = f"face_{saved}.jpg"
+                cv2.imwrite(str(SAVE_DIR / name), crop)
+                db[name] = emb(crop)
+                saved += 1
+
+            if db:
+                best_name, sim = max(((n, cos(ft.vec, e)) for n, e in db.items()),
+                                     key=lambda t: t[1])
+                if mode != "TRAINING":
+                    mode = "LOCK" if sim >= THR else "TRACKING"
+                label, col = (f"TRACK {best_name} {sim:.2f}", (255, 0, 0)) if sim >= THR \
+                             else (f"UNKNOWN {sim:.2f}", (0, 0, 255))
+                cv2.putText(frame, label, (x1, y1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        cv2.putText(frame, f"{mode}  FPS:{fps:.1f}", (10, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+        cv2.imshow("EdgeFace USB Webcam (Gray, toggle+lock)", frame)
+
+    cap.release(); cv2.destroyAllWindows()
 
 if __name__ == "__main__":
     main()
