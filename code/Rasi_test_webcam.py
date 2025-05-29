@@ -20,12 +20,14 @@ YOLO_W     = ROOT / "yolov11n-face.onnx"
 EDGE_MODEL = "edgeface_xxs"
 EDGE_CKPT  = ROOT / "edgeface_xxs.pt"          # 사전 다운로드 필요
 
+'''
 if not EDGE_CKPT.exists():
     raise FileNotFoundError(
         "edgeface_xxs.pt 가 없습니다.\n"
         "https://huggingface.co/Idiap/EdgeFace-XXS/resolve/main/edgeface_xxs.pt"
         " 에서 다운로드해 이 스크립트와 같은 폴더에 넣어 주세요."
     )
+'''
 
 yolo = YOLO(model=str(YOLO_W), task="detect")
 
